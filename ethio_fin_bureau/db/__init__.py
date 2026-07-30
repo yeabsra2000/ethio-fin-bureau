@@ -1,0 +1,1 @@
+"""Database persistence layer for the Ethiopian Financial Intelligence Bureau."""

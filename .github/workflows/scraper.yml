@@ -1,0 +1,68 @@
+name: Financial Intelligence Scraper
+
+on:
+  schedule:
+    # Run every hour during Ethiopian market hours (9 AM - 5 PM EAT = 6 AM - 2 PM UTC)
+    # Ethiopian time is UTC+3
+    - cron: '0 6 * * 1-5'   # Monday-Friday 6:00 AM UTC (9:00 AM EAT)
+    - cron: '0 7 * * 1-5'   # Monday-Friday 7:00 AM UTC (10:00 AM EAT)
+    - cron: '0 8 * * 1-5'   # Monday-Friday 8:00 AM UTC (11:00 AM EAT)
+    - cron: '0 9 * * 1-5'   # Monday-Friday 9:00 AM UTC (12:00 PM EAT)
+    - cron: '0 10 * * 1-5'  # Monday-Friday 10:00 AM UTC (1:00 PM EAT)
+    - cron: '0 11 * * 1-5'  # Monday-Friday 11:00 AM UTC (2:00 PM EAT)
+    - cron: '0 12 * * 1-5'  # Monday-Friday 12:00 PM UTC (3:00 PM EAT)
+    - cron: '0 13 * * 1-5'  # Monday-Friday 1:00 PM UTC (4:00 PM EAT)
+    - cron: '0 14 * * 1-5'  # Monday-Friday 2:00 PM UTC (5:00 PM EAT)
+  workflow_dispatch:  # Allow manual trigger
+
+jobs:
+  scrape-and-analyze:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Run financial intelligence pipeline
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          python -m ethio_fin_bureau.main --llm --new-schema --llm-max 10 --db --telegram
+      
+      - name: Upload output artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-output
+          path: |
+            ethio_fin_bureau/output.json
+            ethio_fin_bureau/data/*.db
+          retention-days: 30
+      
+      - name: Notify on failure
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          curl -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "chat_id": "${{ secrets.TELEGRAM_CHAT_ID }}",
+              "text": "⚠️ Financial Intelligence Pipeline Failed\n\nWorkflow: ${{ github.workflow }}\nRun: ${{ github.run_id }}\nError: Check GitHub Actions logs",
+              "parse_mode": "HTML"
+            }'
