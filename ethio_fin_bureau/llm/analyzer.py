@@ -187,17 +187,18 @@ def analyze_articles(articles: List[ScrapedArticle], max_items: int = 10) -> Lis
     return results
 
 
-def analyze_articles_new(articles: List[ScrapedArticle], max_items: int = 10) -> List[MarketIntelligenceReport]:
+def analyze_articles_new(articles: List[ScrapedArticle], max_items: int = 10) -> List[tuple]:
     """
     Run LLM structured analysis on top-scored articles using the new schema.
-    Returns MarketIntelligenceReport objects with enhanced financial intelligence.
+    Returns list of tuples: (MarketIntelligenceReport, ScrapedArticle)
+    Includes long-term memory by searching for similar historical records.
     """
     client = _build_client()
     if client is None:
         logger.info("LLM analysis skipped (no API key or base URL configured).")
-        return [_create_fallback_report(a.headline, a.source_name) for a in articles[:max_items]]
+        return [(_create_fallback_report(a.headline, a.source_name), a) for a in articles[:max_items]]
 
-    results: List[MarketIntelligenceReport] = []
+    results: List[tuple] = []
     batch = sorted(articles, key=lambda a: a.relevance_score, reverse=True)[:max_items]
 
     system_prompt = (
@@ -211,13 +212,36 @@ def analyze_articles_new(articles: List[ScrapedArticle], max_items: int = 10) ->
     )
 
     for article in batch:
+        # Search for similar historical records (long-term memory)
+        historical_context = ""
+        try:
+            from ethio_fin_bureau.db.database import search_similar_records
+            similar_records = search_similar_records(article.headline, limit=3)
+            
+            if similar_records:
+                historical_context = "\n\n[HISTORICAL CONTEXT]\n"
+                historical_context += "The following similar events from the past may provide context:\n\n"
+                for i, record in enumerate(similar_records, 1):
+                    historical_context += f"{i}. [{record['impact_level'].upper()}] {record['headline']}\n"
+                    historical_context += f"   Date: {record['created_at']}\n"
+                    historical_context += f"   Summary: {record['executive_summary'][:200]}...\n"
+                    historical_context += f"   Sentiment: {record['sentiment'].upper()}\n"
+                    historical_context += f"   Similarity: {record['similarity']:.2%}\n\n"
+                
+                historical_context += "Consider these historical patterns when analyzing the current event.\n"
+                historical_context += "Identify correlations, trend trajectories, and synthesized market impact.\n"
+        except Exception as e:
+            logger.debug("Could not retrieve historical context: %s", e)
+        
         user_prompt = (
             f"Source: {article.source_name} ({article.tier})\n"
             f"Headline: {article.headline}\n"
             f"URL: {article.url}\n"
             f"Date: {article.published_date or 'unknown'}\n"
             f"Keywords: {', '.join(article.keywords_matched) or 'none'}"
+            f"{historical_context}"
         )
+        
         model = _get_model()
         try:
             intel = client.chat.completions.create(
@@ -228,10 +252,13 @@ def analyze_articles_new(articles: List[ScrapedArticle], max_items: int = 10) ->
                     {"role": "user", "content": user_prompt},
                 ],
                 temperature=0.3,
+                max_retries=2,  # Add retries for transient errors
             )
-            results.append(intel)
+            if intel is None:
+                raise ValueError("LLM returned None response")
+            results.append((intel, article))
         except Exception as exc:
             logger.warning("LLM analysis failed for '%s': %s", article.headline[:50], exc)
-            results.append(_create_fallback_report(article.headline, article.source_name))
+            results.append((_create_fallback_report(article.headline, article.source_name), article))
 
     return results

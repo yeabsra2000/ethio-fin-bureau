@@ -7,6 +7,12 @@ from typing import List, Optional
 from sqlalchemy import Column, String, DateTime, Integer, Text, create_engine
 from sqlalchemy.orm import DeclarativeBase, Session
 
+try:
+    from pgvector.sqlalchemy import Vector
+    HAS_PGVECTOR = True
+except (ImportError, ModuleNotFoundError):
+    HAS_PGVECTOR = False
+
 
 class Base(DeclarativeBase):
     pass
@@ -31,6 +37,11 @@ class FinancialRecord(Base):
     affected_entities = Column(Text, nullable=True)
     trading_implication = Column(Text, nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    
+    # Vector embedding for semantic search (requires pgvector)
+    # Only define column if pgvector is actually installed
+    if HAS_PGVECTOR:
+        embedding = Column(Vector(384), nullable=True)
 
     def to_dict(self) -> dict:
         """Convert record to dictionary for JSON serialization."""

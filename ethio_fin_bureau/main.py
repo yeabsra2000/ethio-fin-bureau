@@ -127,15 +127,47 @@ async def run_pipeline(run_llm: bool = False, llm_max: int = 10, use_new_schema:
     raw = await engine.run()
     articles = enrich_and_filter(raw)
     intelligence: List = []
+    
+    # OPTIMIZATION: Only run LLM on NEW articles to conserve tokens
+    # Check which articles are new (not in database) before spawning AI
     if run_llm and articles:
-        if use_new_schema:
-            intelligence = analyze_articles_new(articles, max_items=llm_max)
+        from ethio_fin_bureau.db.database import is_hash_exists
+        
+        new_articles = []
+        for article in articles:
+            content_hash = _generate_content_hash(article.headline, str(article.url))
+            if not is_hash_exists(content_hash):
+                new_articles.append(article)
+        
+        if new_articles:
+            logger.info("Running LLM analysis on %d new articles (skipping %d duplicates)", 
+                       len(new_articles), len(articles) - len(new_articles))
+            
+            # Sort by relevance and limit
+            new_articles_sorted = sorted(new_articles, key=lambda a: a.relevance_score, reverse=True)[:llm_max]
+            
+            if use_new_schema:
+                # Returns list of tuples: (MarketIntelligenceReport, ScrapedArticle)
+                intel_with_articles = analyze_articles_new(new_articles_sorted, max_items=len(new_articles_sorted))
+                # Extract just the intelligence reports for the output
+                intelligence = [intel for intel, _ in intel_with_articles]
+                # Store the mapping for persistence
+                intelligence_article_map = {id(intel): article for intel, article in intel_with_articles}
+            else:
+                intelligence = analyze_articles(new_articles_sorted, max_items=len(new_articles_sorted))
+                intelligence_article_map = {}
         else:
-            intelligence = analyze_articles(articles, max_items=llm_max)
+            logger.info("All %d articles already in database - skipping LLM analysis", len(articles))
+            intelligence_article_map = {}
+    else:
+        intelligence_article_map = {}
+    
     output = PipelineOutput(
         scraped_at=datetime.now(timezone.utc).isoformat(),
         total_items=len(articles), articles=articles, intelligence=intelligence,
     )
+    # Attach the mapping to the output for use in persistence
+    output.intelligence_article_map = intelligence_article_map
     return output
 
 
@@ -149,27 +181,59 @@ def save_output(output: PipelineOutput) -> None:
 
 
 def persist_intelligence(output: PipelineOutput) -> int:
-    if not USE_SQLITE:
+    # Save if SQLite is enabled OR if DATABASE_URL is set (PostgreSQL)
+    if not USE_SQLITE and not os.environ.get("DATABASE_URL"):
         return 0
     init_db()
     saved_count = 0
-    for article, intel in zip(output.articles, output.intelligence):
+    
+    # Use the intelligence_article_map if available (from new schema)
+    intelligence_article_map = getattr(output, 'intelligence_article_map', {})
+    
+    for intel in output.intelligence:
         if isinstance(intel, MarketIntelligenceReport):
-            record_dict = _intel_to_db_record(intel, article)
+            # Try to get the matching article from the map
+            matching_article = intelligence_article_map.get(id(intel))
+            
+            # If not in map, try headline matching as fallback
+            if not matching_article:
+                for article in output.articles:
+                    if article.headline in intel.executive_summary or intel.executive_summary[:100] in article.headline:
+                        matching_article = article
+                        break
+            
+            # If still not found, skip this intelligence item
+            if not matching_article:
+                logger.warning("Could not find matching article for intelligence: %s", intel.executive_summary[:100])
+                continue
+            
+            record_dict = _intel_to_db_record(intel, matching_article)
             if save_record(record_dict):
                 saved_count += 1
+    
     logger.info("Persisted %d intelligence reports to database.", saved_count)
     return saved_count
 
 
 async def broadcast_intelligence(output: PipelineOutput) -> int:
     reports = []
-    for article, intel in zip(output.articles, output.intelligence):
+    # Use the intelligence_article_map if available (from new schema)
+    intelligence_article_map = getattr(output, 'intelligence_article_map', {})
+    
+    for intel in output.intelligence:
         if isinstance(intel, MarketIntelligenceReport):
+            # Try to get the matching article from the map
+            matching_article = intelligence_article_map.get(id(intel))
+            
+            # If not in map, skip this intelligence item
+            if not matching_article:
+                logger.warning("Could not find matching article for Telegram broadcast: %s", intel.executive_summary[:100])
+                continue
+            
             reports.append({
-                "source_name": article.source_name,
-                "headline": article.headline,
-                "normalized_date": article.published_date or "Unknown",
+                "source_name": matching_article.source_name,
+                "headline": matching_article.headline,
+                "normalized_date": matching_article.published_date or "Unknown",
                 "sentiment": intel.sentiment.value,
                 "impact_level": intel.impact_level.value,
                 "primary_asset_class": intel.primary_asset_class.value,
@@ -189,6 +253,28 @@ def check_llm_config() -> bool:
         return True
     logger.warning("No LLM API key found.")
     return False
+
+
+def handle_rate_limit_error(error_msg: str) -> None:
+    """
+    Handle OpenRouter rate limit errors with helpful message.
+    
+    Args:
+        error_msg: Error message from the API
+    """
+    if "Rate limit exceeded" in error_msg or "429" in error_msg:
+        logger.error("=" * 60)
+        logger.error("OPENROUTER RATE LIMIT EXCEEDED")
+        logger.error("=" * 60)
+        logger.error("Free tier limit: 50 requests/day")
+        logger.error("")
+        logger.error("Solutions:")
+        logger.error("1. Wait for daily reset (midnight UTC)")
+        logger.error("2. Add $10 credits at https://openrouter.ai/account")
+        logger.error("   (unlocks 1,000 requests/day)")
+        logger.error("3. Use OpenAI instead (add OPENAI_API_KEY to .env)")
+        logger.error("4. Reduce --llm-max to use fewer requests")
+        logger.error("=" * 60)
 
 
 def main() -> None:
@@ -247,23 +333,20 @@ Examples:
             db_saved = persist_intelligence(output)
             if db_saved:
                 print(f"  DB records saved: {db_saved}")
+            # If using DB mode and no new records, skip Telegram
+            if db_saved == 0:
+                logger.info("Skipping Telegram - all intelligence already in database")
+                telegram_sent = 0
 
-        if args.telegram and output.intelligence:
-            # Only broadcast if we have new intelligence (either new to DB or just generated)
-            # If --db is enabled, only broadcast newly saved records
-            # If --db is not enabled, broadcast all intelligence
-            if args.db:
-                # Only broadcast if we actually saved new records
-                if db_saved > 0:
-                    logger.info("Broadcasting %d new intelligence reports via Telegram", db_saved)
-                    telegram_sent = asyncio.run(broadcast_intelligence(output))
-                    if telegram_sent:
-                        print(f"  Telegram alerts sent: {telegram_sent}")
-                else:
-                    logger.info("Skipping Telegram broadcast - all %d reports are duplicates", len(output.intelligence))
+        if args.telegram and output.intelligence and telegram_sent == 0:
+            # Only broadcast if we haven't already sent Telegram alerts
+            # If --db is enabled, only broadcast if we saved new records
+            if args.db and db_saved == 0:
+                # Already logged above, skip
+                pass
             else:
-                # No DB mode, broadcast all intelligence
-                logger.info("Broadcasting all %d intelligence reports via Telegram (no DB mode)", len(output.intelligence))
+                # No DB mode or new records saved - broadcast
+                logger.info("Broadcasting %d intelligence reports via Telegram", len(output.intelligence))
                 telegram_sent = asyncio.run(broadcast_intelligence(output))
                 if telegram_sent:
                     print(f"  Telegram alerts sent: {telegram_sent}")

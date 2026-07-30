@@ -3,13 +3,14 @@
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
+import numpy as np
 from sqlalchemy import create_engine, func
 from sqlalchemy.orm import Session, sessionmaker
 
 from ethio_fin_bureau.config import USE_SQLITE
-from ethio_fin_bureau.db.models import Base, FinancialRecord
+from ethio_fin_bureau.db.models import Base, FinancialRecord, HAS_PGVECTOR
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +72,69 @@ def _init_engine():
         )
     
     _SessionFactory = sessionmaker(bind=_engine)
+
+
+def _generate_embedding(text: str) -> Optional[List[float]]:
+    """
+    Generate vector embedding for text using simple TF-IDF-like approach.
+    Falls back to None if pgvector is not available.
+    
+    Args:
+        text: Text to embed
+        
+    Returns:
+        List of floats representing the embedding, or None
+    """
+    if not HAS_PGVECTOR:
+        return None
+    
+    try:
+        # Simple embedding using character n-grams (384 dimensions)
+        # In production, use OpenAI embeddings or similar
+        text = text.lower().strip()
+        embedding = np.zeros(384)
+        
+        # Character-level n-grams (3-grams)
+        for i in range(len(text) - 2):
+            ngram = text[i:i+3]
+            idx = hash(ngram) % 384
+            embedding[idx] += 1
+        
+        # Normalize
+        norm = np.linalg.norm(embedding)
+        if norm > 0:
+            embedding = embedding / norm
+        
+        return embedding.tolist()
+    except Exception as e:
+        logger.error("Failed to generate embedding: %s", e)
+        return None
+
+
+def _safe_save_record(record_dict: Dict[str, Any]) -> bool:
+    """
+    Save record with graceful fallback if embedding column doesn't exist.
+    
+    Args:
+        record_dict: Dictionary containing record data
+        
+    Returns:
+        True if saved successfully, False otherwise
+    """
+    # Try with embedding first
+    if HAS_PGVECTOR and "embedding" in record_dict:
+        try:
+            return save_record(record_dict)
+        except Exception as e:
+            if "embedding" in str(e).lower() and "does not exist" in str(e).lower():
+                logger.warning("Embedding column not found, saving without embedding")
+                # Remove embedding and try again
+                record_dict_without_embedding = {k: v for k, v in record_dict.items() if k != "embedding"}
+                return save_record(record_dict_without_embedding)
+            else:
+                raise
+    else:
+        return save_record(record_dict)
 
 
 def init_db() -> None:
@@ -148,6 +212,16 @@ def save_record(record_dict: Dict[str, Any]) -> bool:
                 import json
                 record_dict["affected_entities"] = json.dumps(affected_entities)
             
+            # Generate embedding for vector search (if column exists)
+            headline = record_dict.get("headline", "")
+            summary = record_dict.get("executive_summary", "")
+            embedding_text = f"{headline} {summary}"
+            
+            if HAS_PGVECTOR:
+                embedding = _generate_embedding(embedding_text)
+                if embedding:
+                    record_dict["embedding"] = embedding
+            
             record = FinancialRecord(**record_dict)
             session.add(record)
             session.commit()
@@ -155,8 +229,23 @@ def save_record(record_dict: Dict[str, Any]) -> bool:
             return True
         except Exception as e:
             session.rollback()
-            logger.error("Failed to save record: %s", e)
-            return False
+            # If error is about missing embedding column, try without it
+            if "embedding" in str(e).lower() and "does not exist" in str(e).lower():
+                logger.warning("Embedding column not found, saving without embedding")
+                record_dict_without_embedding = {k: v for k, v in record_dict.items() if k != "embedding"}
+                try:
+                    record = FinancialRecord(**record_dict_without_embedding)
+                    session.add(record)
+                    session.commit()
+                    logger.debug("Saved record without embedding: %s", record_dict.get("headline", "")[:50])
+                    return True
+                except Exception as e2:
+                    session.rollback()
+                    logger.error("Failed to save record even without embedding: %s", e2)
+                    return False
+            else:
+                logger.error("Failed to save record: %s", e)
+                return False
         finally:
             session.close()
     except Exception as e:
@@ -204,3 +293,64 @@ def get_stats() -> Dict[str, Any]:
     except Exception as e:
         logger.error("Failed to get stats: %s", e)
         return {"enabled": False, "error": str(e)}
+
+
+def search_similar_records(headline: str, limit: int = 3) -> List[Dict[str, Any]]:
+    """
+    Search for similar historical records using vector similarity.
+    
+    Args:
+        headline: Headline to search for
+        limit: Maximum number of results to return
+        
+    Returns:
+        List of similar records with similarity scores
+    """
+    if not USE_SQLITE and not os.environ.get("DATABASE_URL"):
+        return []
+    
+    if not HAS_PGVECTOR:
+        logger.debug("pgvector not available, skipping vector search")
+        return []
+    
+    try:
+        # Generate embedding for the headline
+        embedding = _generate_embedding(headline)
+        if not embedding:
+            return []
+        
+        session = get_session()
+        try:
+            # Use pgvector's cosine similarity
+            # Note: This requires PostgreSQL with pgvector extension
+            from sqlalchemy import text
+            
+            query = text("""
+                SELECT id, headline, executive_summary, sentiment, impact_level, 
+                       created_at, 1 - (embedding <=> :embedding) as similarity
+                FROM financial_records
+                WHERE embedding IS NOT NULL
+                ORDER BY embedding <=> :embedding
+                LIMIT :limit
+            """)
+            
+            results = session.execute(query, {"embedding": str(embedding), "limit": limit})
+            
+            similar_records = []
+            for row in results:
+                similar_records.append({
+                    "id": row[0],
+                    "headline": row[1],
+                    "executive_summary": row[2],
+                    "sentiment": row[3],
+                    "impact_level": row[4],
+                    "created_at": row[5].isoformat() if row[5] else None,
+                    "similarity": float(row[6]),
+                })
+            
+            return similar_records
+        finally:
+            session.close()
+    except Exception as e:
+        logger.error("Failed to search similar records: %s", e)
+        return []

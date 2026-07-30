@@ -3,7 +3,7 @@
 from enum import Enum
 from typing import List, Optional, Union
 
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, Field, HttpUrl, ConfigDict
 
 
 class FinancialSentiment(str, Enum):
@@ -54,6 +54,18 @@ class ScrapedArticle(BaseModel):
     keywords_matched: List[str] = Field(default_factory=list)
 
 
+class HistoricalConnection(BaseModel):
+    """Represents a connection to a historical event."""
+    
+    headline: str = Field(description="Headline of the historical event")
+    summary: str = Field(description="Brief summary of what happened")
+    sentiment: FinancialSentiment = Field(description="Sentiment of the historical event")
+    impact_level: MarketImpact = Field(description="Impact level of the historical event")
+    similarity: float = Field(ge=0.0, le=1.0, description="Similarity score to current event")
+    correlation_type: str = Field(description="Type of correlation: 'trend_continuation', 'trend_reversal', 'causal', 'coincidental'")
+    trend_trajectory: str = Field(description="How this event relates to the trend: 'accelerating', 'decelerating', 'stable', 'new_direction'")
+
+
 class MarketIntelligenceReport(BaseModel):
     """Structured LLM output for institutional financial intelligence."""
 
@@ -72,6 +84,14 @@ class MarketIntelligenceReport(BaseModel):
     )
     trading_implication: str = Field(
         description="1-sentence actionable risk/opportunity signal for capital allocators"
+    )
+    historical_connections: List[HistoricalConnection] = Field(
+        default_factory=list,
+        description="Correlations with past events from long-term memory"
+    )
+    synthesized_market_impact: Optional[str] = Field(
+        default=None,
+        description="Synthesized impact considering historical context and current event"
     )
 
 
@@ -94,6 +114,8 @@ class MarketIntelligence(BaseModel):
 class PipelineOutput(BaseModel):
     """Final persisted output schema."""
 
+    model_config = ConfigDict(extra='allow')  # Allow arbitrary attributes
+    
     scraped_at: str
     total_items: int
     articles: List[ScrapedArticle]
