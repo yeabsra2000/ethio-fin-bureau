@@ -124,13 +124,14 @@ async def broadcast_alerts(
 ) -> int:
     """
     Broadcast intelligence reports via Telegram.
+    Batches all reports into a single consolidated message.
     
     Args:
         reports: List of intelligence report dictionaries
         min_impact: Minimum impact level to broadcast (LOW, MEDIUM, HIGH, CRITICAL)
         
     Returns:
-        Number of alerts successfully sent
+        Number of alerts successfully sent (1 if batch sent, 0 otherwise)
     """
     bot_token = os.environ.get(TELEGRAM_BOT_TOKEN_ENV)
     chat_id = os.environ.get(TELEGRAM_CHAT_ID_ENV)
@@ -166,11 +167,48 @@ async def broadcast_alerts(
     
     logger.info("Broadcasting %d alerts via Telegram...", len(filtered_reports))
     
-    sent_count = 0
-    for report in filtered_reports:
-        message = _format_report_message(report)
+    # Build a single consolidated message with all reports
+    if len(filtered_reports) == 1:
+        # Single report - use the individual format
+        message = _format_report_message(filtered_reports[0])
         if await _send_telegram_message(bot_token, chat_id, message):
-            sent_count += 1
+            logger.info("Successfully sent 1/1 Telegram alert.")
+            return 1
+        return 0
     
-    logger.info("Successfully sent %d/%d Telegram alerts.", sent_count, len(filtered_reports))
-    return sent_count
+    # Multiple reports - batch into a single digest message
+    digest_lines = []
+    digest_lines.append("<b>📊 Financial Intelligence Digest</b>")
+    digest_lines.append(f"<i>{len(filtered_reports)} new intelligence reports</i>\n")
+    
+    for i, report in enumerate(filtered_reports, 1):
+        headline = report.get("headline", "No headline")[:80]
+        source = report.get("source_name", "Unknown")
+        sentiment = report.get("sentiment", "NEUTRAL")
+        impact = report.get("impact_level", "LOW")
+        summary = report.get("executive_summary", "No summary available")[:200]
+        trading_imp = report.get("trading_implication", "No trading implication")[:100]
+        
+        emoji = "🟢" if sentiment == "BULLISH" else ("🔴" if sentiment == "BEARISH" else "⚪")
+        impact_emoji = "🔥" if impact == "HIGH" else ("📌" if impact == "MEDIUM" else "💡")
+        
+        digest_lines.append(f"\n{emoji} <b>Report #{i}</b>")
+        digest_lines.append(f"<b>Headline:</b> {headline}")
+        digest_lines.append(f"<b>Source:</b> {source} | {impact_emoji} Impact: {impact} | Sentiment: {sentiment}")
+        digest_lines.append(f"<b>Summary:</b> {summary}")
+        digest_lines.append(f"<b>Signal:</b> {trading_imp}")
+    
+    digest_lines.append("\n<i>Ethiopian Financial Intelligence Bureau</i>")
+    
+    message = "\n".join(digest_lines)
+    
+    # Telegram has a 4096 character limit per message
+    if len(message) > 4096:
+        # Truncate the entire message at 4096 characters
+        message = message[:4090] + "\n\n<i>...truncated</i>"
+    
+    if await _send_telegram_message(bot_token, chat_id, message):
+        logger.info("Successfully sent consolidated digest with %d reports.", len(filtered_reports))
+        return len(filtered_reports)
+    
+    return 0

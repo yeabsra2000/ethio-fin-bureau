@@ -46,7 +46,7 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
-          python -m ethio_fin_bureau.main --llm --new-schema --llm-max 10 --db --telegram
+          python -m ethio_fin_bureau.main --llm --new-schema --llm-max 3 --db --telegram
       
       - name: Upload output artifacts
         if: always()
