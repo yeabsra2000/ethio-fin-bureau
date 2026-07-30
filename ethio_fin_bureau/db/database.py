@@ -166,17 +166,22 @@ def get_session() -> Session:
 
 
 def is_hash_exists(content_hash: str) -> bool:
-    """Check if a content hash already exists in the database."""
+    """Check if a content hash already exists in the database.
+    
+    Uses raw SQL to avoid issues with missing columns (like embedding).
+    """
     if not USE_SQLITE and not os.environ.get("DATABASE_URL"):
         return False
     
     try:
         session = get_session()
         try:
-            exists = session.query(FinancialRecord).filter(
-                FinancialRecord.content_hash == content_hash
-            ).first() is not None
-            return exists
+            from sqlalchemy import text
+            result = session.execute(
+                text("SELECT 1 FROM financial_records WHERE content_hash = :hash LIMIT 1"),
+                {"hash": content_hash}
+            ).scalar()
+            return result is not None
         finally:
             session.close()
     except Exception as e:
