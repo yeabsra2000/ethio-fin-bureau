@@ -295,15 +295,6 @@ Ethiopian Financial Intelligence Bureau
 - Database uniqueness constraints
 - Idempotent pipeline execution
 
-### ✅ Zero-Cost Hosting
-| Service | Free Limit | Monthly Cost |
-|---------|-----------|--------------|
-| GitHub Actions | 2,000 min | $0 |
-| Neon PostgreSQL | 512 MB | $0 |
-| OpenRouter API | Free models | $0 |
-| Telegram API | Unlimited | $0 |
-| **Total** | | **$0/month** |
-
 ### ✅ Automatic Scheduling
 - Runs during Ethiopian market hours (Mon-Fri, 9 AM - 5 PM EAT)
 - No server required (serverless)
