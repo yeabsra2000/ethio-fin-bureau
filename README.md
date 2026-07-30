@@ -410,7 +410,7 @@ This project is licensed under the MIT License - see [LICENSE](LICENSE) file for
 
 - **Issues:** [GitHub Issues](https://github.com/yourusername/ethio-fin-bureau/issues)
 - **Documentation:** See [DEPLOYMENT.md](DEPLOYMENT.md)
-- **Telegram:** @EthioFinBureauSupport
+- **Telegram:** @searchfast
 
 ---
 
