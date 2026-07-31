@@ -221,13 +221,36 @@ CREATE TABLE financial_records (
     sentiment VARCHAR(20),
     impact_level VARCHAR(20),
     primary_asset_class VARCHAR(50),
-    affected_entities TEXT,  -- JSON array
+    affected_entities TEXT,        -- JSON array
     trading_implication TEXT,
+    event_type VARCHAR(50),        -- NEW: regulatory, listing, monetary_policy, etc.
+    time_horizon VARCHAR(20),      -- NEW: immediate, short_term, medium_term, long_term
+    confidence_score FLOAT,        -- NEW: 0.0-1.0 confidence in assessment
+    key_metrics TEXT,              -- NEW: JSON array of {name, value, context}
+    actionable_signals TEXT,       -- NEW: JSON array of {signal_type, asset, rationale, urgency}
+    synthesized_market_impact TEXT, -- NEW: combined impact from historical context
+    historical_connections TEXT,    -- NEW: JSON array of related past events
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- Index for fast deduplication
+-- Indexes for performance
 CREATE UNIQUE INDEX idx_content_hash ON financial_records(content_hash);
+CREATE INDEX idx_financial_records_event_type ON financial_records(event_type);
+CREATE INDEX idx_financial_records_impact_level ON financial_records(impact_level);
+CREATE INDEX idx_financial_records_sentiment ON financial_records(sentiment);
+```
+
+### Migration for Existing Databases
+If you already have a database, run this migration to add the new columns:
+```sql
+-- See migrate_add_new_columns.sql for the full migration
+ALTER TABLE financial_records ADD COLUMN IF NOT EXISTS event_type VARCHAR(50);
+ALTER TABLE financial_records ADD COLUMN IF NOT EXISTS time_horizon VARCHAR(20);
+ALTER TABLE financial_records ADD COLUMN IF NOT EXISTS confidence_score FLOAT;
+ALTER TABLE financial_records ADD COLUMN IF NOT EXISTS key_metrics TEXT;
+ALTER TABLE financial_records ADD COLUMN IF NOT EXISTS actionable_signals TEXT;
+ALTER TABLE financial_records ADD COLUMN IF NOT EXISTS synthesized_market_impact TEXT;
+ALTER TABLE financial_records ADD COLUMN IF NOT EXISTS historical_connections TEXT;
 ```
 
 ---

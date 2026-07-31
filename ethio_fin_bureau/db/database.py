@@ -1,12 +1,13 @@
 """Database initialization and operations for the Ethiopian Financial Intelligence Bureau."""
 
+import json
 import logging
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import numpy as np
-from sqlalchemy import create_engine, func
+from sqlalchemy import create_engine, func, or_
 from sqlalchemy.orm import Session, sessionmaker
 
 from ethio_fin_bureau.config import USE_SQLITE
@@ -111,32 +112,6 @@ def _generate_embedding(text: str) -> Optional[List[float]]:
         return None
 
 
-def _safe_save_record(record_dict: Dict[str, Any]) -> bool:
-    """
-    Save record with graceful fallback if embedding column doesn't exist.
-    
-    Args:
-        record_dict: Dictionary containing record data
-        
-    Returns:
-        True if saved successfully, False otherwise
-    """
-    # Try with embedding first
-    if HAS_PGVECTOR and "embedding" in record_dict:
-        try:
-            return save_record(record_dict)
-        except Exception as e:
-            if "embedding" in str(e).lower() and "does not exist" in str(e).lower():
-                logger.warning("Embedding column not found, saving without embedding")
-                # Remove embedding and try again
-                record_dict_without_embedding = {k: v for k, v in record_dict.items() if k != "embedding"}
-                return save_record(record_dict_without_embedding)
-            else:
-                raise
-    else:
-        return save_record(record_dict)
-
-
 def init_db() -> None:
     """
     Initialize the database and create all tables.
@@ -214,7 +189,6 @@ def save_record(record_dict: Dict[str, Any]) -> bool:
             # Convert affected_entities list to JSON string
             affected_entities = record_dict.get("affected_entities", [])
             if isinstance(affected_entities, list):
-                import json
                 record_dict["affected_entities"] = json.dumps(affected_entities)
             
             # Generate embedding for vector search (if column exists)
@@ -258,6 +232,93 @@ def save_record(record_dict: Dict[str, Any]) -> bool:
         return False
 
 
+def save_intelligence_report(record_dict: Dict[str, Any]) -> bool:
+    """
+    Save an enhanced intelligence report with all new fields.
+    Handles JSON serialization of complex fields automatically.
+    
+    Args:
+        record_dict: Dictionary containing record data with all enhanced fields
+        
+    Returns:
+        True if saved successfully, False otherwise
+    """
+    if not USE_SQLITE and not os.environ.get("DATABASE_URL"):
+        return False
+    
+    try:
+        # Check for duplicate
+        content_hash = record_dict.get("content_hash")
+        if content_hash and is_hash_exists(content_hash):
+            logger.debug("Record with hash %s already exists, skipping.", content_hash[:16])
+            return False
+        
+        session = get_session()
+        try:
+            # Convert list fields to JSON strings
+            for field in ["affected_entities", "key_metrics", "actionable_signals", "historical_connections"]:
+                value = record_dict.get(field)
+                if isinstance(value, (list, dict)):
+                    record_dict[field] = json.dumps(value, ensure_ascii=False)
+            
+            # Generate embedding for vector search (if column exists)
+            headline = record_dict.get("headline", "")
+            summary = record_dict.get("executive_summary", "")
+            embedding_text = f"{headline} {summary}"
+            
+            if HAS_PGVECTOR:
+                embedding = _generate_embedding(embedding_text)
+                if embedding:
+                    record_dict["embedding"] = embedding
+            
+            record = FinancialRecord(**record_dict)
+            session.add(record)
+            session.commit()
+            logger.debug("Saved intelligence report: %s", record_dict.get("headline", "")[:50])
+            return True
+        except Exception as e:
+            session.rollback()
+            # If error is about missing columns, try without new fields
+            error_str = str(e).lower()
+            if any(col in error_str for col in ["event_type", "time_horizon", "confidence_score", "key_metrics", "actionable_signals"]):
+                logger.warning("New columns not found in database, saving with basic fields only")
+                # Strip new fields and try again
+                basic_fields = {k: v for k, v in record_dict.items() 
+                              if k not in ["event_type", "time_horizon", "confidence_score", 
+                                          "key_metrics", "actionable_signals", 
+                                          "synthesized_market_impact", "historical_connections"]}
+                try:
+                    record = FinancialRecord(**basic_fields)
+                    session.add(record)
+                    session.commit()
+                    logger.debug("Saved basic record: %s", record_dict.get("headline", "")[:50])
+                    return True
+                except Exception as e2:
+                    session.rollback()
+                    logger.error("Failed to save basic record: %s", e2)
+                    return False
+            elif "embedding" in error_str and "does not exist" in error_str:
+                logger.warning("Embedding column not found, saving without embedding")
+                record_dict_without_embedding = {k: v for k, v in record_dict.items() if k != "embedding"}
+                try:
+                    record = FinancialRecord(**record_dict_without_embedding)
+                    session.add(record)
+                    session.commit()
+                    return True
+                except Exception as e2:
+                    session.rollback()
+                    logger.error("Failed to save record without embedding: %s", e2)
+                    return False
+            else:
+                logger.error("Failed to save intelligence report: %s", e)
+                return False
+        finally:
+            session.close()
+    except Exception as e:
+        logger.error("Failed to save intelligence report: %s", e)
+        return False
+
+
 def get_stats() -> Dict[str, Any]:
     """
     Get database statistics.
@@ -287,11 +348,22 @@ def get_stats() -> Dict[str, Any]:
             ).group_by(FinancialRecord.impact_level).all():
                 impact_counts[impact or "UNKNOWN"] = count
             
+            # Get event type distribution
+            event_type_counts = {}
+            try:
+                for event_type, count in session.query(
+                    FinancialRecord.event_type, func.count(FinancialRecord.id)
+                ).group_by(FinancialRecord.event_type).all():
+                    event_type_counts[event_type or "UNKNOWN"] = count
+            except Exception:
+                event_type_counts = {"N/A": 0}
+            
             return {
                 "enabled": True,
                 "total_records": total,
                 "by_sentiment": sentiment_counts,
                 "by_impact": impact_counts,
+                "by_event_type": event_type_counts,
             }
         finally:
             session.close()
@@ -302,7 +374,8 @@ def get_stats() -> Dict[str, Any]:
 
 def search_similar_records(headline: str, limit: int = 3) -> List[Dict[str, Any]]:
     """
-    Search for similar historical records using vector similarity.
+    Search for similar historical records using vector similarity (PostgreSQL)
+    or keyword matching (SQLite fallback).
     
     Args:
         headline: Headline to search for
@@ -314,48 +387,152 @@ def search_similar_records(headline: str, limit: int = 3) -> List[Dict[str, Any]
     if not USE_SQLITE and not os.environ.get("DATABASE_URL"):
         return []
     
-    if not HAS_PGVECTOR:
-        logger.debug("pgvector not available, skipping vector search")
-        return []
+    # Try pgvector first if available
+    if HAS_PGVECTOR:
+        try:
+            embedding = _generate_embedding(headline)
+            if embedding:
+                session = get_session()
+                try:
+                    from sqlalchemy import text
+                    query = text("""
+                        SELECT id, headline, executive_summary, sentiment, impact_level, 
+                               created_at, 1 - (embedding <=> :embedding) as similarity
+                        FROM financial_records
+                        WHERE embedding IS NOT NULL
+                        ORDER BY embedding <=> :embedding
+                        LIMIT :limit
+                    """)
+                    results = session.execute(query, {"embedding": str(embedding), "limit": limit})
+                    similar_records = []
+                    for row in results:
+                        similar_records.append({
+                            "id": row[0],
+                            "headline": row[1],
+                            "executive_summary": row[2],
+                            "sentiment": row[3],
+                            "impact_level": row[4],
+                            "created_at": row[5].isoformat() if row[5] else None,
+                            "similarity": float(row[6]),
+                        })
+                    if similar_records:
+                        return similar_records
+                finally:
+                    session.close()
+        except Exception as e:
+            logger.debug("pgvector search failed, falling back to keyword: %s", e)
     
+    # Fallback: keyword-based search for SQLite
     try:
-        # Generate embedding for the headline
-        embedding = _generate_embedding(headline)
-        if not embedding:
-            return []
-        
         session = get_session()
         try:
-            # Use pgvector's cosine similarity
-            # Note: This requires PostgreSQL with pgvector extension
+            # Extract meaningful keywords from the headline
+            keywords = _extract_search_keywords(headline)
+            
+            if not keywords:
+                return []
+            
+            # Build LIKE conditions for each keyword
+            conditions = []
+            for kw in keywords:
+                conditions.append(FinancialRecord.headline.ilike(f"%{kw}%"))
+                conditions.append(FinancialRecord.executive_summary.ilike(f"%{kw}%"))
+            
+            if not conditions:
+                return []
+            
+            # Query records matching any keyword
             from sqlalchemy import text
+            query = session.query(
+                FinancialRecord.id,
+                FinancialRecord.headline,
+                FinancialRecord.executive_summary,
+                FinancialRecord.sentiment,
+                FinancialRecord.impact_level,
+                FinancialRecord.created_at,
+            ).filter(or_(*conditions)).order_by(
+                FinancialRecord.created_at.desc()
+            ).limit(limit * 2)  # Get extra for scoring
             
-            query = text("""
-                SELECT id, headline, executive_summary, sentiment, impact_level, 
-                       created_at, 1 - (embedding <=> :embedding) as similarity
-                FROM financial_records
-                WHERE embedding IS NOT NULL
-                ORDER BY embedding <=> :embedding
-                LIMIT :limit
-            """)
+            results = query.all()
             
-            results = session.execute(query, {"embedding": str(embedding), "limit": limit})
+            if not results:
+                return []
             
-            similar_records = []
+            # Score results by keyword match density
+            scored_results = []
+            headline_lower = headline.lower()
             for row in results:
-                similar_records.append({
-                    "id": row[0],
-                    "headline": row[1],
-                    "executive_summary": row[2],
-                    "sentiment": row[3],
-                    "impact_level": row[4],
-                    "created_at": row[5].isoformat() if row[5] else None,
-                    "similarity": float(row[6]),
+                # Calculate similarity score based on keyword overlap
+                record_text = f"{row.headline} {row.executive_summary or ''}".lower()
+                match_count = sum(1 for kw in keywords if kw.lower() in record_text)
+                similarity = min(1.0, match_count / max(len(keywords), 1))
+                
+                scored_results.append({
+                    "id": row.id,
+                    "headline": row.headline,
+                    "executive_summary": row.executive_summary,
+                    "sentiment": row.sentiment,
+                    "impact_level": row.impact_level,
+                    "created_at": row.created_at.isoformat() if row.created_at else None,
+                    "similarity": similarity,
                 })
             
-            return similar_records
+            # Sort by similarity and return top results
+            scored_results.sort(key=lambda r: r["similarity"], reverse=True)
+            return scored_results[:limit]
+            
         finally:
             session.close()
     except Exception as e:
         logger.error("Failed to search similar records: %s", e)
         return []
+
+
+def _extract_search_keywords(text: str) -> List[str]:
+    """
+    Extract meaningful search keywords from text.
+    Filters out common stop words and short words.
+    
+    Args:
+        text: Text to extract keywords from
+        
+    Returns:
+        List of meaningful keywords
+    """
+    stop_words = {
+        "the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for",
+        "of", "by", "with", "from", "as", "is", "was", "are", "were", "be",
+        "been", "being", "have", "has", "had", "do", "does", "did", "will",
+        "would", "could", "should", "may", "might", "shall", "can", "not",
+        "no", "nor", "its", "it's", "this", "that", "these", "those",
+        "new", "news", "latest", "update", "report", "announcement",
+    }
+    
+    # Split into words and filter
+    words = text.lower().split()
+    keywords = []
+    
+    for word in words:
+        # Clean the word
+        word = word.strip(".,!?;:'\"()[]{}")
+        
+        # Skip short words, stop words, and purely numeric tokens
+        if len(word) < 4:
+            continue
+        if word in stop_words:
+            continue
+        if word.isdigit():
+            continue
+        
+        keywords.append(word)
+    
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_keywords = []
+    for kw in keywords:
+        if kw not in seen:
+            seen.add(kw)
+            unique_keywords.append(kw)
+    
+    return unique_keywords[:10]  # Limit to 10 keywords

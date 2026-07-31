@@ -8,6 +8,8 @@ CREATE EXTENSION IF NOT EXISTS vector;
 SELECT * FROM pg_extension WHERE extname = 'vector';
 
 -- Create a function to match the similarity search in database.py
+DROP FUNCTION IF EXISTS match_financial_records;
+
 CREATE OR REPLACE FUNCTION match_financial_records(
     query_embedding vector(384),
     match_threshold float,
@@ -19,6 +21,9 @@ RETURNS TABLE (
     executive_summary text,
     sentiment text,
     impact_level text,
+    event_type text,
+    time_horizon text,
+    confidence_score float,
     created_at timestamptz,
     similarity float
 )
@@ -30,6 +35,9 @@ AS $$
         financial_records.executive_summary,
         financial_records.sentiment,
         financial_records.impact_level,
+        financial_records.event_type,
+        financial_records.time_horizon,
+        financial_records.confidence_score,
         financial_records.created_at,
         1 - (financial_records.embedding <=> query_embedding) AS similarity
     FROM financial_records

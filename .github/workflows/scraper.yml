@@ -55,6 +55,9 @@ jobs:
           name: pipeline-output
           path: |
             ethio_fin_bureau/output.json
+            output.json
+            ethio_fin_bureau/report.md
+            report.md
             ethio_fin_bureau/data/*.db
           retention-days: 30
       

@@ -70,34 +70,59 @@ def is_noise(headline: str, url: str) -> bool:
 def score_relevance(headline: str, tier: str, require_match: bool) -> Tuple[float, List[str]]:
     """
     Score headline relevance for capital-market intelligence (0.0–1.0).
-    Tier 1 regulatory sources bypass keyword requirements.
-    Tier 2/3 require at least one strong signal keyword.
+    Tier 1 regulatory sources always get a high baseline score.
+    Tier 2/3 require at least one strong signal keyword to pass.
+    
+    Returns:
+        Tuple of (score 0.0-1.0, list of matched keywords)
     """
     text = headline.lower()
     matched: List[str] = []
 
+    # Count strong keyword hits
     strong_hits = 0
     for kw in STRONG_SIGNAL_KEYWORDS:
         if _contains_keyword(text, kw):
             strong_hits += 1
             matched.append(kw)
 
-    weak_hits = sum(1 for kw in WEAK_SIGNAL_KEYWORDS if _contains_keyword(text, kw))
+    # Count weak keyword hits (avoid duplicates already in matched)
+    weak_hits = 0
     for kw in WEAK_SIGNAL_KEYWORDS:
-        if _contains_keyword(text, kw) and kw not in matched:
-            matched.append(kw)
+        if _contains_keyword(text, kw):
+            if kw not in matched:
+                weak_hits += 1
+                matched.append(kw)
 
-    low_hits = sum(1 for kw in LOW_SIGNAL_KEYWORDS if _contains_keyword(text, kw))
+    # Count low signal hits (detractors - these lower the score)
+    low_hits = 0
+    for kw in LOW_SIGNAL_KEYWORDS:
+        if _contains_keyword(text, kw):
+            low_hits += 1
+            # Don't add low signal to matched list - they're not useful
 
-    score = min(1.0, (strong_hits * 0.30) + (weak_hits * 0.10) - (low_hits * 0.08) + 0.05)
+    # Calculate score with diminishing returns for multiple hits
+    # Base score starts at 0.05
+    # Each strong keyword adds 0.25 (max 0.75 from strong)
+    # Each weak keyword adds 0.08 (max 0.24 from weak)
+    # Each low signal keyword subtracts 0.10 (max -0.30 from low)
+    strong_contribution = min(strong_hits * 0.25, 0.75)
+    weak_contribution = min(weak_hits * 0.08, 0.24)
+    low_penalty = min(low_hits * 0.10, 0.30)
+    
+    score = max(0.0, min(1.0, 0.05 + strong_contribution + weak_contribution - low_penalty))
 
+    # Tier 1 regulatory sources always get a high baseline score
     if tier == "Tier_1_Regulatory":
         score = max(score, 0.85)
         return score, matched
 
+    # For Tier 2/3 with require_match, if no strong keywords found, score is capped at 0.3
     if require_match and strong_hits == 0:
+        score = min(score, 0.30)
         return score, matched
 
+    # For Tier 2/3 with require_match, minimum score threshold applies
     if require_match and score < MIN_RELEVANCE_SCORE:
         return score, matched
 

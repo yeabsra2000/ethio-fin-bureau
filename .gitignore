@@ -37,6 +37,7 @@ logs/
 
 # Output
 output.json
+report.md
 *.json
 !requirements*.json
 
